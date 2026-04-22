@@ -25,3 +25,6 @@ cryptography==43.0.1
 
 # Utils
 tqdm==4.66.4
+
+
+python-dotenv
