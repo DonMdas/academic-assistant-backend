@@ -10,7 +10,6 @@ htmlcov/
 .venv/
 venv/
 env/
-.python-version
 
 .env
 credentials.json
