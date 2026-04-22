@@ -12,6 +12,8 @@ def _env_text(name: str, default: str) -> str:
     if raw is None:
         return default
     value = str(raw).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
     return value if value else default
 
 
@@ -44,8 +46,12 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 def _env_csv(name: str, default: str = "*") -> list[str]:
     raw = _env_text(name, default)
-    values = [item.strip() for item in raw.split(",")]
-    return [item for item in values if item]
+    values = []
+    for item in raw.split(","):
+        normalized = item.strip().strip("'").strip('"').rstrip("/")
+        if normalized:
+            values.append(normalized)
+    return values
 
 
 def _env_required(name: str) -> str:
@@ -75,6 +81,7 @@ class Settings:
     REFRESH_TOKEN_EXPIRY_DAYS = max(1, _env_int("REFRESH_TOKEN_EXPIRY_DAYS", 7))
     REFRESH_COOKIE_NAME = _env_text("REFRESH_COOKIE_NAME", "refresh_token")
     COOKIE_SECURE = _env_flag("COOKIE_SECURE", False)
+    COOKIE_SAMESITE = _env_text("COOKIE_SAMESITE", "lax").lower()
 
     GOOGLE_CLIENT_ID = _env_text("GOOGLE_CLIENT_ID", "")
     GOOGLE_OAUTH_CREDENTIALS_PATH = _env_text("GOOGLE_OAUTH_CREDENTIALS_PATH", "credentials.json")

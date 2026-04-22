@@ -107,12 +107,13 @@ def _issue_tokens(db: Session, user: User) -> tuple[str, str]:
 
 
 def _set_refresh_cookie(response: JSONResponse, refresh_token: str) -> None:
+    same_site = settings.COOKIE_SAMESITE if settings.COOKIE_SAMESITE in {"lax", "strict", "none"} else "lax"
     response.set_cookie(
         key=settings.REFRESH_COOKIE_NAME,
         value=refresh_token,
         httponly=True,
         secure=settings.COOKIE_SECURE,
-        samesite="lax",
+        samesite=same_site,
         max_age=_cookie_max_age_seconds(settings.REFRESH_TOKEN_EXPIRY_DAYS),
         path="/",
     )
