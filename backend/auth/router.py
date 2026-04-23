@@ -176,6 +176,35 @@ def _load_calendar_credential_row(db: Session, user_id: str) -> GoogleCalendarCr
     return db.scalar(select(GoogleCalendarCredential).where(GoogleCalendarCredential.user_id == user_id))
 
 
+def _build_google_oauth_flow(redirect_uri: str):
+    try:
+        from google_auth_oauthlib.flow import Flow
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Google OAuth libraries are not available",
+        ) from exc
+
+    try:
+        flow = Flow.from_client_secrets_file(settings.GOOGLE_OAUTH_CREDENTIALS_PATH, scopes=SCOPES)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Google OAuth client secrets file not found. "
+                "Set GOOGLE_OAUTH_CREDENTIALS_PATH to your OAuth client JSON file path."
+            ),
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Google OAuth client secrets could not be loaded. Check GOOGLE_OAUTH_CREDENTIALS_PATH.",
+        ) from exc
+
+    flow.redirect_uri = redirect_uri
+    return flow
+
+
 @router.post(
     "/google",
     response_model=AuthResponse,
@@ -288,17 +317,8 @@ def get_google_calendar_authorization_url(
 ):
     del current_user
 
-    try:
-        from google_auth_oauthlib.flow import Flow
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Google OAuth libraries are not available",
-        ) from exc
-
     resolved_redirect_uri = _resolve_calendar_redirect_uri(redirect_uri)
-    flow = Flow.from_client_secrets_file(settings.GOOGLE_OAUTH_CREDENTIALS_PATH, scopes=SCOPES)
-    flow.redirect_uri = resolved_redirect_uri
+    flow = _build_google_oauth_flow(resolved_redirect_uri)
     authorization_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
@@ -317,17 +337,8 @@ def connect_google_calendar(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    try:
-        from google_auth_oauthlib.flow import Flow
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Google OAuth libraries are not available",
-        ) from exc
-
     resolved_redirect_uri = _resolve_calendar_redirect_uri(payload.redirect_uri)
-    flow = Flow.from_client_secrets_file(settings.GOOGLE_OAUTH_CREDENTIALS_PATH, scopes=SCOPES)
-    flow.redirect_uri = resolved_redirect_uri
+    flow = _build_google_oauth_flow(resolved_redirect_uri)
 
     try:
         flow.fetch_token(code=payload.authorization_code)
