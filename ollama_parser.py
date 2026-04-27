@@ -8,6 +8,13 @@ import re
 from collections.abc import Mapping
 from config import OLLAMA_BASE_URL, DISABLE_OLLAMA_THINKING, QWEN_MODEL
 
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except Exception:
+    genai = None
+    genai_types = None
+
 MODEL = QWEN_MODEL
 
 
@@ -196,6 +203,56 @@ def _prepend_no_think_message(messages):
     return [{"role": "system", "content": "/no_think"}] + cleaned
 
 
+def _build_fallback_prompt(messages, enforce_json=False):
+    parts = []
+    if enforce_json:
+        parts.append(
+            "Return ONLY a valid JSON object. "
+            "No markdown, no explanations, no extra text."
+        )
+    for message in list(messages or []):
+        message_dict = _message_to_dict(message)
+        role = str(message_dict.get("role", "user") or "user").strip().lower()
+        content = str(message_dict.get("content", "") or "").strip()
+        if not content:
+            continue
+        if role:
+            parts.append(f"{role}: {content}")
+        else:
+            parts.append(content)
+    return "\n".join(parts).strip()
+
+
+def _chat_gemma_fallback(messages, output_format=None):
+    model_name = os.getenv("GEMMA_FALLBACK_MODEL", "gemma-4-26b-a4b-it")
+    api_key = os.getenv("GEMINI_API_KEY")
+    if genai is None or not api_key:
+        return {}
+
+    client = genai.Client(api_key=api_key)
+    prompt = _build_fallback_prompt(messages, enforce_json=(output_format == "json"))
+    if not prompt:
+        return {}
+
+    config_kwargs = {
+        "temperature": 0.1,
+        "max_output_tokens": 1024,
+    }
+    if output_format == "json":
+        config_kwargs["response_mime_type"] = "application/json"
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(**config_kwargs),
+    )
+    raw_text = str(getattr(response, "text", "") or "").strip()
+    if not raw_text:
+        return {}
+
+    return _normalize_chat_response({"message": {"content": raw_text}})
+
+
 def _chat_once(messages, output_format=None):
     chat_kwargs = {
         "model": MODEL,
@@ -233,9 +290,27 @@ def _chat_once(messages, output_format=None):
 def chat_ollama(messages, output_format=None, retries=3):
     for attempt in range(retries):
         try:
-            return _chat_once(messages=messages, output_format=output_format)
+            response = _chat_once(messages=messages, output_format=output_format)
+            if output_format == "json":
+                content = str(response.get("message", {}).get("content", "") or "").strip()
+                if not _parse_json_content(content):
+                    raise ValueError("Ollama returned non-JSON content")
+            return response
         except Exception as e:
-            print(f"⚠️ Retry {attempt+1}: {e}")
+            print(f"⚠️ Ollama attempt {attempt + 1} failed: {e}")
+
+        try:
+            fallback_response = _chat_gemma_fallback(messages, output_format=output_format)
+            if fallback_response:
+                if output_format == "json":
+                    content = str(fallback_response.get("message", {}).get("content", "") or "").strip()
+                    if not _parse_json_content(content):
+                        raise ValueError("Gemma returned non-JSON content")
+                return fallback_response
+        except Exception as e:
+            print(f"⚠️ Gemma fallback attempt {attempt + 1} failed: {e}")
+
+        if attempt < retries - 1:
             time.sleep(1)
 
     return {}

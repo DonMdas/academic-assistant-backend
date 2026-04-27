@@ -701,6 +701,10 @@ in the end for the final json result start with ```json and end with ```
                 stop_reason = "parse_empty_response"
                 break
 
+            reason_text = str(action.get("reason") or "").strip()
+            if reason_text:
+                _planner_log(f"[Planner] Gemma turn {turn_index + 1} reason: {reason_text}")
+
             kind = str(action.get("action", "")).strip().lower()
 
             if kind == "tool_call":
