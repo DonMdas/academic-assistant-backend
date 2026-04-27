@@ -358,8 +358,8 @@ def generate_plan(
         )
         is not None
     )
-    effective_user_feedback = str(payload.user_feedback or "").strip() if has_existing_plan else ""
-    effective_feedback_history = list(payload.feedback_history or []) if has_existing_plan else []
+    effective_user_feedback = str(payload.user_feedback or "").strip()
+    effective_feedback_history = list(payload.feedback_history or [])
 
     operation_id = operation_logs.start(
         user_id=current_user.id,
@@ -425,8 +425,8 @@ def generate_plan_async(
         )
         is not None
     )
-    effective_user_feedback = str(payload.user_feedback or "").strip() if has_existing_plan else ""
-    effective_feedback_history = list(payload.feedback_history or []) if has_existing_plan else []
+    effective_user_feedback = str(payload.user_feedback or "").strip()
+    effective_feedback_history = list(payload.feedback_history or [])
 
     operation_id = operation_logs.start(
         user_id=current_user.id,

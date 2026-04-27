@@ -276,8 +276,11 @@ def build_plan_slots(chunks, free_blocks, constraints):
         consumed = {chunk.chunk_id: 0 for chunk in ordered_chunks}
         slots = []
 
+        def _has_remaining_work():
+            return any(remaining.get(chunk.chunk_id, 0) > 0 for chunk in ordered_chunks)
+
         for block_start, block_end in free_blocks:
-            if not any(remaining.get(chunk.chunk_id, 0) > 0 for chunk in ordered_chunks):
+            if not _has_remaining_work():
                 break
 
             block_minutes = int((block_end - block_start).total_seconds() // 60)
@@ -286,88 +289,105 @@ def build_plan_slots(chunks, free_blocks, constraints):
 
             used = 0
             cursor = block_start
-            items = []
-
             while used + min_slot <= block_minutes:
-                chunk = _select_chunk_for_block(
-                    cursor + timedelta(minutes=used),
-                    remaining=remaining,
-                    include_overrides=include_overrides,
-                )
-                if chunk is None:
+                if not _has_remaining_work():
                     break
 
-                need = remaining[chunk.chunk_id]
-                if need <= 0:
-                    continue
+                remaining_block = block_minutes - used
+                slot_limit = remaining_block if max_slot is None else min(max_slot, remaining_block)
+                if slot_limit < min_slot:
+                    break
 
-                piece = min(
-                    need,
-                    block_minutes - used,
-                    (max_slot if max_slot is not None else block_minutes - used),
-                    _slot_target_minutes(chunk.difficulty),
-                )
+                slot_start = cursor + timedelta(minutes=used)
+                slot_used = 0
+                items = []
 
-                if piece < min_slot:
-                    if need <= min_slot and (block_minutes - used) >= need:
-                        piece = need
-                    else:
+                while slot_used < slot_limit:
+                    absolute_used = used + slot_used
+                    chunk = _select_chunk_for_block(
+                        cursor + timedelta(minutes=absolute_used),
+                        remaining=remaining,
+                        include_overrides=include_overrides,
+                    )
+                    if chunk is None:
                         break
 
-                item_start = cursor + timedelta(minutes=used)
-                item_end = item_start + timedelta(minutes=int(piece))
-                consumed_before = int(consumed.get(chunk.chunk_id, 0))
-                focus_topics = _focus_topics_for_piece(
-                    chunk=chunk,
-                    consumed_before=consumed_before,
-                    piece_minutes=int(piece),
-                )
-                progress_start_pct = round((consumed_before / max(1, int(chunk.estimated_time))) * 100.0, 2)
-                progress_end_pct = round(((consumed_before + int(piece)) / max(1, int(chunk.estimated_time))) * 100.0, 2)
+                    need = remaining[chunk.chunk_id]
+                    if need <= 0:
+                        continue
 
-                items.append({
-                    "chunk_id": chunk.chunk_id,
-                    "doc_id": chunk.doc_id,
-                    "topic": chunk.topic,
-                    "focus_topics": focus_topics,
-                    "summary": chunk.summary,
-                    "difficulty": chunk.difficulty,
-                    "prerequisites": list(chunk.prerequisites),
-                    "allocated_minutes": int(piece),
-                    "required_minutes": int(chunk.estimated_time),
-                    "chunk_progress_pct_start": progress_start_pct,
-                    "chunk_progress_pct_end": progress_end_pct,
-                    "scheduled_date": item_start.date().isoformat(),
-                    "scheduled_start_time": item_start.isoformat(),
-                    "scheduled_end_time": item_end.isoformat(),
-                })
+                    block_left = block_minutes - absolute_used
+                    slot_left = slot_limit - slot_used
+                    if block_left <= 0 or slot_left <= 0:
+                        break
 
-                used += int(piece)
-                remaining[chunk.chunk_id] -= int(piece)
-                consumed[chunk.chunk_id] += int(piece)
+                    piece = min(
+                        need,
+                        block_left,
+                        slot_left,
+                        _slot_target_minutes(chunk.difficulty),
+                    )
+                    if piece <= 0:
+                        break
 
-            if not items:
-                continue
+                    item_start = cursor + timedelta(minutes=absolute_used)
+                    item_end = item_start + timedelta(minutes=int(piece))
+                    consumed_before = int(consumed.get(chunk.chunk_id, 0))
+                    focus_topics = _focus_topics_for_piece(
+                        chunk=chunk,
+                        consumed_before=consumed_before,
+                        piece_minutes=int(piece),
+                    )
+                    progress_start_pct = round((consumed_before / max(1, int(chunk.estimated_time))) * 100.0, 2)
+                    progress_end_pct = round(((consumed_before + int(piece)) / max(1, int(chunk.estimated_time))) * 100.0, 2)
 
-            slot_end = cursor + timedelta(minutes=used)
-            difficulty = _primary_slot_difficulty(items)
-            prerequisites = sorted({p for item in items for p in item.get("prerequisites", []) if str(p).strip()})
-            chunk_ids = [item["chunk_id"] for item in items]
+                    items.append({
+                        "chunk_id": chunk.chunk_id,
+                        "doc_id": chunk.doc_id,
+                        "topic": chunk.topic,
+                        "focus_topics": focus_topics,
+                        "summary": chunk.summary,
+                        "difficulty": chunk.difficulty,
+                        "prerequisites": list(chunk.prerequisites),
+                        "allocated_minutes": int(piece),
+                        "required_minutes": int(chunk.estimated_time),
+                        "chunk_progress_pct_start": progress_start_pct,
+                        "chunk_progress_pct_end": progress_end_pct,
+                        "scheduled_date": item_start.date().isoformat(),
+                        "scheduled_start_time": item_start.isoformat(),
+                        "scheduled_end_time": item_end.isoformat(),
+                    })
 
-            slot = {
-                "slot_id": str(uuid.uuid4()),
-                "start_time": cursor.isoformat(),
-                "end_time": slot_end.isoformat(),
-                "duration_minutes": int(used),
-                "difficulty": difficulty,
-                "items": items,
-                "prerequisites": prerequisites,
-                "coverage_chunk_ids": chunk_ids,
-                "calendar_status": "pending",
-            }
-            slot["title"] = _build_slot_title(items)
-            slot["description"] = _build_slot_description(slot)
-            slots.append(slot)
+                    slot_used += int(piece)
+                    remaining[chunk.chunk_id] -= int(piece)
+                    consumed[chunk.chunk_id] += int(piece)
+
+                if not items:
+                    break
+
+                slot_end = slot_start + timedelta(minutes=slot_used)
+                difficulty = _primary_slot_difficulty(items)
+                prerequisites = sorted({p for item in items for p in item.get("prerequisites", []) if str(p).strip()})
+                chunk_ids = [item["chunk_id"] for item in items]
+
+                slot = {
+                    "slot_id": str(uuid.uuid4()),
+                    "start_time": slot_start.isoformat(),
+                    "end_time": slot_end.isoformat(),
+                    "duration_minutes": int(slot_used),
+                    "difficulty": difficulty,
+                    "items": items,
+                    "prerequisites": prerequisites,
+                    "coverage_chunk_ids": chunk_ids,
+                    "calendar_status": "pending",
+                }
+                slot["title"] = _build_slot_title(items)
+                slot["description"] = _build_slot_description(slot)
+                slots.append(slot)
+
+                used += int(slot_used)
+                if slot_used <= 0:
+                    break
 
         return slots
 

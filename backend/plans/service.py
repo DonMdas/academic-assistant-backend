@@ -1,3 +1,4 @@
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -18,7 +19,6 @@ from planner_ai import (
     _post_review_refinement_reasons,
     apply_chunk_prerequisite_updates,
     apply_constraint_updates,
-    derive_constraint_updates_from_user_feedback,
     qwen_review_plan,
     reset_planner_runtime_log_sink,
     set_planner_runtime_log_sink,
@@ -125,6 +125,157 @@ def _coerce_feedback_history(feedback_history: list[str] | None) -> list[str]:
             continue
         out.append(text)
     return out
+
+
+def _is_affirmative_feedback(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    tokens = {"yes", "y", "yeah", "yep", "sure", "ok", "okay", "do it", "go ahead", "proceed"}
+    if normalized in tokens:
+        return True
+    return any(token in normalized for token in ["yes", "do it", "go ahead", "proceed", "sure", "okay", "ok"])
+
+
+def _is_negative_feedback(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    tokens = {"no", "n", "nope", "nah", "do not", "don't", "dont", "keep"}
+    if normalized in tokens:
+        return True
+    return any(token in normalized for token in ["no", "do not", "don't", "dont", "keep as", "leave as"])
+
+
+def _extract_daily_limit_from_clarification(question: str) -> int | None:
+    text = str(question or "").strip().lower()
+    if not text:
+        return None
+
+    for pattern in [
+        r"\bupdate(?:\s+\w+){0,8}\s+to\s+(\d{1,4})\s*minutes?\b",
+        r"\((\d{1,4})\s*minutes?\)",
+        r"\b(\d{1,4})\s*minutes?\b",
+    ]:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        try:
+            value = int(match.group(1))
+        except Exception:
+            continue
+        if 30 <= value <= 720:
+            return value
+    return None
+
+
+def _extract_minutes_value_from_text(text: str) -> int | None:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return None
+
+    compound = re.search(
+        r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h)\s*(?:and\s*)?(\d+(?:\.\d+)?)?\s*(minutes?|mins?|min|m)?\b",
+        lowered,
+    )
+    if compound:
+        try:
+            hours = float(compound.group(1))
+            mins = float(compound.group(3)) if compound.group(3) and compound.group(4) else 0.0
+            total = int(round(hours * 60 + mins))
+            if 30 <= total <= 720:
+                return total
+        except Exception:
+            pass
+
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|mins?|min|m)\b", lowered)
+    if not match:
+        return None
+
+    try:
+        amount = float(match.group(1))
+    except Exception:
+        return None
+
+    unit = str(match.group(2) or "").strip().lower()
+    minutes = int(round(amount * 60)) if unit.startswith("h") else int(round(amount))
+    if 30 <= minutes <= 720:
+        return minutes
+    return None
+
+
+def _extract_direct_daily_override_from_feedback(feedback_text: str, constraints: dict) -> int | None:
+    text = str(feedback_text or "").strip().lower()
+    if not text:
+        return None
+
+    # Direct override intent: "set/update/change ... to 75 mins"
+    if not re.search(r"\b(?:set|update|change|make)\b", text):
+        return None
+    if not re.search(r"\bto\b", text):
+        return None
+
+    minutes = _extract_minutes_value_from_text(text)
+    if minutes is None:
+        return None
+
+    if re.search(r"\b(?:daily|per\s*day|a\s*day|study\s*limit|session\s*time)\b", text):
+        return minutes
+
+    if re.search(r"\b(?:slot|session\s*length|min\s*slot|max\s*slot)\b", text):
+        return None
+
+    # If existing constraints clearly track a daily study limit request, treat this as daily override.
+    additional = str(dict(constraints or {}).get("additional_constraints") or "").strip().lower()
+    current_daily = dict(constraints or {}).get("daily_max_minutes")
+    if current_daily is not None and re.search(r"\b(?:daily|per\s*day|session\s*time)\b", additional):
+        return minutes
+
+    return None
+
+
+def _apply_pending_clarification_to_revision(
+    constraints: dict,
+    feedback_text: str,
+    feedback_history: list[str],
+) -> tuple[dict, list[str], dict[str, Any]]:
+    next_constraints = dict(constraints or {})
+    next_history = list(feedback_history or [])
+    applied_updates: dict[str, Any] = {}
+
+    question = str(next_constraints.get("clarification_question") or "").strip()
+    if not question:
+        question = str(next_constraints.get("feedback_prompt") or "").strip()
+    if not question:
+        return next_constraints, next_history, applied_updates
+
+    question_context = f"Planner clarification: {question}"
+    if question_context not in next_history:
+        next_history.append(question_context)
+
+    response_text = str(feedback_text or "").strip()
+    if response_text:
+        response_context = f"User response: {response_text}"
+        if response_context not in next_history:
+            next_history.append(response_context)
+
+    lowered_question = question.lower()
+    if "daily" in lowered_question and "minute" in lowered_question:
+        if _is_affirmative_feedback(response_text):
+            requested = _extract_daily_limit_from_clarification(question)
+            if requested is not None:
+                next_constraints["daily_max_minutes"] = requested
+                applied_updates["daily_max_minutes"] = requested
+        elif _is_negative_feedback(response_text):
+            applied_updates["daily_max_minutes"] = next_constraints.get("daily_max_minutes")
+
+    if response_text:
+        next_constraints["clarification_question"] = ""
+        next_constraints["feedback_prompt"] = ""
+        next_constraints["feedback_source"] = ""
+        next_constraints["user_feedback_requested"] = False
+
+    return next_constraints, next_history, applied_updates
 
 
 def _extract_constraint_updates(gemma_feedback: dict | None) -> dict:
@@ -407,6 +558,11 @@ def _run_planner_pipeline(
     chunks = list(run_context["chunks"])
 
     locked_constraint_keys = _locked_constraint_keys(current_constraints)
+    if str(user_feedback or "").strip():
+        # Explicit revision feedback should be allowed to adjust minute caps.
+        locked_constraint_keys.discard("daily_max_minutes")
+        locked_constraint_keys.discard("min_slot_minutes")
+        locked_constraint_keys.discard("max_slot_minutes")
 
     slots: list[dict] = []
     coverage: dict[str, Any] = {}
@@ -555,73 +711,92 @@ def _run_planner_pipeline(
             },
         )
 
-        if (not needs_regeneration and not changed) or round_idx == (pass_count - 1):
+        if not needs_regeneration and not changed:
+            break
+            
+        if round_idx == (pass_count - 1):
+            # Force a final rebuild if the very last pass updated constraints
+            _op_log(operation_id, f"Final round changed constraints, syncing slots before proceeding")
+            slots, current_constraints, coverage, schedule_end, schedule_data = _build_schedule_once(
+                chunks=chunks,
+                constraints=current_constraints,
+                start_date=start_date,
+                end_date=end_date,
+                tzinfo=tzinfo,
+                calendar_service=calendar_service,
+                calendar_id=calendar_id,
+            )
             break
 
         _op_log(operation_id, "Gemma requested schedule regeneration", metadata={"round": round_number})
 
-    review_payload = {
-        "phase": "api_plan_generate" if run_main_passes else "api_plan_revise",
-        "session_id": schedule_id,
-        "plan": _plan_snapshot(slots=slots, coverage=coverage, constraints=current_constraints),
-    }
+    feedback_text = str(user_feedback or "").strip()
+    feedback_history_rows = _coerce_feedback_history(feedback_history)
+    skip_pre_feedback_review = bool(feedback_text)
 
-    _op_log(operation_id, "Running Qwen review", metadata={"phase": review_payload.get("phase")})
-    qwen_feedback = qwen_review_plan(review_payload)
-    qwen_feedback_history.append(dict(qwen_feedback or {}))
-    _op_log(
-        operation_id,
-        "Qwen review completed",
-        metadata={
-            "severity": _normalize_int(dict(qwen_feedback or {}).get("severity"), 1, minimum=0, maximum=3),
-            "approval_ready": bool(dict(qwen_feedback or {}).get("approval_ready", False)),
-        },
-    )
+    if not skip_pre_feedback_review:
+        review_payload = {
+            "phase": "api_plan_generate" if run_main_passes else "api_plan_revise",
+            "session_id": schedule_id,
+            "plan": _plan_snapshot(slots=slots, coverage=coverage, constraints=current_constraints),
+        }
 
-    escalation_result = _apply_qwen_escalation_if_needed(
-        qwen_feedback=qwen_feedback,
-        constraints=current_constraints,
-        locked_constraint_keys=locked_constraint_keys,
-        chunks=chunks,
-        start_date=start_date,
-        end_date=end_date,
-        schedule_end=schedule_end,
-        tzinfo=tzinfo,
-        calendar_service=calendar_service,
-        calendar_id=calendar_id,
-    )
-    if escalation_result.get("escalated"):
-        before_constraints = dict(current_constraints)
-        before_coverage = dict(coverage)
-
-        current_constraints = dict(escalation_result.get("constraints", current_constraints))
-        escalated_slots = escalation_result.get("slots")
-        if escalated_slots is not None:
-            slots = list(escalated_slots)
-        escalated_coverage = escalation_result.get("coverage")
-        if escalated_coverage is not None:
-            coverage = dict(escalated_coverage)
-        qwen_feedback = dict(escalation_result.get("qwen_feedback", qwen_feedback))
-        schedule_end = escalation_result.get("schedule_end", schedule_end)
+        _op_log(operation_id, "Running Qwen review", metadata={"phase": review_payload.get("phase")})
+        qwen_feedback = qwen_review_plan(review_payload)
         qwen_feedback_history.append(dict(qwen_feedback or {}))
-
-        round_change_log.append(
-            {
-                "phase": "qwen_severity_3_reset",
-                "constraint_diff": _constraints_diff(before_constraints, current_constraints),
-                "coverage_diff": _coverage_diff(before_coverage, coverage),
-            }
-        )
-        _op_log(operation_id, "Applied Qwen severity-3 escalation reset", metadata={"severity": 3}, level="warning")
-
-    post_review_reasons = _post_review_refinement_reasons(qwen_feedback, coverage)
-    if post_review_reasons:
         _op_log(
             operation_id,
-            "Qwen flagged post-review issues",
-            metadata={"reasons": post_review_reasons[:5]},
-            level="warning",
+            "Qwen review completed",
+            metadata={
+                "severity": _normalize_int(dict(qwen_feedback or {}).get("severity"), 1, minimum=0, maximum=3),
+                "approval_ready": bool(dict(qwen_feedback or {}).get("approval_ready", False)),
+            },
         )
+
+        escalation_result = _apply_qwen_escalation_if_needed(
+            qwen_feedback=qwen_feedback,
+            constraints=current_constraints,
+            locked_constraint_keys=locked_constraint_keys,
+            chunks=chunks,
+            start_date=start_date,
+            end_date=end_date,
+            schedule_end=schedule_end,
+            tzinfo=tzinfo,
+            calendar_service=calendar_service,
+            calendar_id=calendar_id,
+        )
+        if escalation_result.get("escalated"):
+            before_constraints = dict(current_constraints)
+            before_coverage = dict(coverage)
+
+            current_constraints = dict(escalation_result.get("constraints", current_constraints))
+            escalated_slots = escalation_result.get("slots")
+            if escalated_slots is not None:
+                slots = list(escalated_slots)
+            escalated_coverage = escalation_result.get("coverage")
+            if escalated_coverage is not None:
+                coverage = dict(escalated_coverage)
+            qwen_feedback = dict(escalation_result.get("qwen_feedback", qwen_feedback))
+            schedule_end = escalation_result.get("schedule_end", schedule_end)
+            qwen_feedback_history.append(dict(qwen_feedback or {}))
+
+            round_change_log.append(
+                {
+                    "phase": "qwen_severity_3_reset",
+                    "constraint_diff": _constraints_diff(before_constraints, current_constraints),
+                    "coverage_diff": _coverage_diff(before_coverage, coverage),
+                }
+            )
+            _op_log(operation_id, "Applied Qwen severity-3 escalation reset", metadata={"severity": 3}, level="warning")
+
+        post_review_reasons = _post_review_refinement_reasons(qwen_feedback, coverage)
+        if post_review_reasons:
+            _op_log(
+                operation_id,
+                "Qwen flagged post-review issues",
+                metadata={"reasons": post_review_reasons[:5]},
+                level="warning",
+            )
 
     if post_review_reasons and gemma_agent is not None:
         review_context = {
@@ -710,32 +885,11 @@ def _run_planner_pipeline(
     elif post_review_reasons and gemma_agent is None:
         _op_log(operation_id, "Skipped post-Qwen refinement because Gemma is unavailable", level="warning")
 
-    feedback_text = str(user_feedback or "").strip()
-    feedback_history_rows = _coerce_feedback_history(feedback_history)
     if feedback_text:
         if feedback_text not in feedback_history_rows:
             feedback_history_rows.append(feedback_text)
 
         _op_log(operation_id, "Applying user feedback revision pass", metadata={"feedback_round": 1})
-
-        reference_dates = [
-            str(slot.get("start_time") or "")[:10]
-            for slot in slots
-            if str(slot.get("start_time") or "").strip()
-        ]
-        reference_dates.extend(
-            [
-                (start_date + timedelta(days=day_offset)).isoformat()
-                for day_offset in range((end_date - start_date).days + 1)
-            ]
-        )
-
-        deterministic_updates, deterministic_notes = derive_constraint_updates_from_user_feedback(
-            user_feedback=feedback_text,
-            feedback_history=feedback_history_rows,
-            current_constraints=current_constraints,
-            reference_dates=reference_dates,
-        )
 
         user_revision_feedback: dict[str, Any] = {}
         if gemma_agent is not None:
@@ -783,30 +937,6 @@ def _run_planner_pipeline(
                 gemma_clarification_question = question
 
         feedback_constraint_updates = _extract_constraint_updates(user_revision_feedback)
-        if deterministic_updates:
-            feedback_constraint_updates.update(deterministic_updates)
-            user_revision_feedback["needs_regeneration"] = True
-
-            merged_model_updates = user_revision_feedback.get("updated_constraints", {})
-            if not isinstance(merged_model_updates, dict):
-                merged_model_updates = {}
-            merged_model_updates.update(deterministic_updates)
-            user_revision_feedback["updated_constraints"] = merged_model_updates
-
-            reason_text = str(user_revision_feedback.get("reason") or "").strip()
-            if "deterministic_user_feedback_update" not in reason_text:
-                reason_text = (reason_text + "; deterministic_user_feedback_update").strip("; ")
-            user_revision_feedback["reason"] = reason_text or "deterministic_user_feedback_update"
-
-            if deterministic_notes:
-                deterministic_note = " ".join(deterministic_notes).strip()
-                summary_text = str(user_revision_feedback.get("final_summary") or "").strip()
-                if deterministic_note and deterministic_note.lower() not in summary_text.lower():
-                    user_revision_feedback["final_summary"] = (
-                        (summary_text + " " + deterministic_note).strip()
-                        if summary_text
-                        else deterministic_note
-                    )
 
         revised_constraints = apply_constraint_updates(
             current=current_constraints,
@@ -848,6 +978,55 @@ def _run_planner_pipeline(
             }
             qwen_feedback = qwen_review_plan(review_payload)
             qwen_feedback_history.append(dict(qwen_feedback or {}))
+
+            escalation_result = _apply_qwen_escalation_if_needed(
+                qwen_feedback=qwen_feedback,
+                constraints=current_constraints,
+                locked_constraint_keys=locked_constraint_keys,
+                chunks=chunks,
+                start_date=start_date,
+                end_date=end_date,
+                schedule_end=schedule_end,
+                tzinfo=tzinfo,
+                calendar_service=calendar_service,
+                calendar_id=calendar_id,
+            )
+            if escalation_result.get("escalated"):
+                current_constraints = dict(escalation_result.get("constraints", current_constraints))
+                escalated_slots = escalation_result.get("slots")
+                if escalated_slots is not None:
+                    slots = list(escalated_slots)
+                escalated_coverage = escalation_result.get("coverage")
+                if escalated_coverage is not None:
+                    coverage = dict(escalated_coverage)
+                qwen_feedback = dict(escalation_result.get("qwen_feedback", qwen_feedback))
+                schedule_end = escalation_result.get("schedule_end", schedule_end)
+                qwen_feedback_history.append(dict(qwen_feedback or {}))
+
+        if not qwen_feedback_history:
+            review_payload = {
+                "phase": "user_feedback_round_1_qwen_review",
+                "session_id": schedule_id,
+                "gemma_feedback": {
+                    "final_summary": user_revision_feedback.get("final_summary", ""),
+                    "reason": user_revision_feedback.get("reason", ""),
+                    "needs_regeneration": user_revision_feedback.get("needs_regeneration", False),
+                },
+                "plan": _plan_snapshot(slots=slots, coverage=coverage, constraints=current_constraints),
+                "user_feedback": feedback_text,
+                "feedback_history": list(feedback_history_rows),
+            }
+            _op_log(operation_id, "Running Qwen review", metadata={"phase": review_payload.get("phase")})
+            qwen_feedback = qwen_review_plan(review_payload)
+            qwen_feedback_history.append(dict(qwen_feedback or {}))
+            _op_log(
+                operation_id,
+                "Qwen review completed",
+                metadata={
+                    "severity": _normalize_int(dict(qwen_feedback or {}).get("severity"), 1, minimum=0, maximum=3),
+                    "approval_ready": bool(dict(qwen_feedback or {}).get("approval_ready", False)),
+                },
+            )
 
             escalation_result = _apply_qwen_escalation_if_needed(
                 qwen_feedback=qwen_feedback,
@@ -967,13 +1146,26 @@ def generate_draft_plan(
     if latest_version and hasattr(latest_version, "version"):
         next_version = (latest_version.version or 0) + 1
 
+    # ---------------------------------------------------------
+    # START REPLACEMENT BLOCK
+    # ---------------------------------------------------------
     effective_user_feedback = str(user_feedback or "").strip()
     effective_feedback_history = _coerce_feedback_history(feedback_history)
-    if latest_version is None:
-        effective_user_feedback = ""
-        effective_feedback_history = []
+    
+    if effective_user_feedback:
+        # Inject the raw text into additional_constraints so Gemma sees it on pass 1
+        existing_add = str(constraints.get("additional_constraints") or "").strip()
+        constraints["additional_constraints"] = f"{existing_add} | Initial Request: {effective_user_feedback}".strip(" |")
         
+    # Unconditionally wipe the feedback variables so the pipeline doesn't trigger an immediate revision loop
+    effective_user_feedback = ""
+    effective_feedback_history = []
+
     sink_token = set_planner_runtime_log_sink(_build_planner_runtime_sink(operation_id))
+    # ---------------------------------------------------------
+    # END REPLACEMENT BLOCK
+    # ---------------------------------------------------------
+
     try:
         slots, stored_constraints, coverage = _run_planner_pipeline(
             db=db,
@@ -1174,6 +1366,27 @@ def revise_plan_with_feedback(
     feedback_text = str(feedback or "").strip()
     if feedback_text and feedback_text not in merged_feedback_history:
         merged_feedback_history.append(feedback_text)
+
+    current_constraints, merged_feedback_history, clarification_updates = _apply_pending_clarification_to_revision(
+        constraints=current_constraints,
+        feedback_text=feedback_text,
+        feedback_history=merged_feedback_history,
+    )
+
+    direct_daily_override = _extract_direct_daily_override_from_feedback(
+        feedback_text=feedback_text,
+        constraints=current_constraints,
+    )
+    if direct_daily_override is not None:
+        current_constraints["daily_max_minutes"] = direct_daily_override
+        clarification_updates["daily_max_minutes"] = direct_daily_override
+
+    if clarification_updates:
+        _op_log(
+            operation_id,
+            "Applied clarification response before revision",
+            metadata=clarification_updates,
+        )
 
     sink_token = set_planner_runtime_log_sink(_build_planner_runtime_sink(operation_id))
     try:

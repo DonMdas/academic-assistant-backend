@@ -45,9 +45,11 @@ from planner_common import (
 from planner_scheduling import build_schedule_data
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
 except Exception:
     genai = None
+    genai_types = None
 
 try:
     import ollama
@@ -153,42 +155,33 @@ Text:
 class _GemmaGeminiClient:
     def __init__(self, model_name):
         if genai is None:
-            raise RuntimeError("google-generativeai is required for GEMMA_BACKEND=gemini.")
+            raise RuntimeError("google-genai is required for GEMMA_BACKEND=gemini. Install with: pip install google-genai")
 
         load_dotenv()
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY not found. Set it in your environment or .env file.")
 
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(
-            model_name,
-            system_instruction=(
-                "You are the primary study-plan orchestrator. "
-                "You can call tools, request clarification, and then finalize constraints "
-                "for scheduling. Return JSON only when asked."
-            ),
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = model_name
+        self.system_instruction = (
+            "You are the primary study-plan orchestrator. "
+            "You can call tools, request clarification, and then finalize constraints "
+            "for scheduling. Return JSON only when asked."
         )
+        
 
     def generate_json(self, prompt, timeout_seconds, max_output_tokens):
-        try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": 0.1,
-                    "max_output_tokens": max_output_tokens,
-                    "response_mime_type": "application/json",
-                },
-                request_options={"timeout": timeout_seconds},
-            )
-        except TypeError:
-            response = self.model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": 0.1,
-                    "max_output_tokens": max_output_tokens,
-                },
-            )
+        full_prompt = self.system_instruction + "\n\n" + prompt
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=full_prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=max_output_tokens,
+                response_mime_type="application/json",
+            ),
+        )
 
         raw_text = str(getattr(response, "text", "") or "")
         qwen_parsed = None
@@ -213,7 +206,7 @@ class _GemmaGeminiClient:
             _planner_log("[Gemma] Qwen failed → returning empty dict")
             parsed = {}
 
-        _append_gemma_raw_output_log({"result":f"[Planner] Gemini raw_text length={len(raw_text)} qwen_res={qwen_parsed},json={parsed}, raw_text = {raw_text}"})
+        _append_gemma_raw_output_log({"result":f"[Planner] Gemini raw_text length={len(raw_text)} qwen_res={qwen_parsed},json={parsed}"})
         return {
             "raw_text": raw_text,
             "parsed": parsed,
@@ -447,8 +440,8 @@ Rules:
 - If turns_remaining_including_this_turn <= 1, return action="final". Do not call tools.
 - If you call set_specific_day_window, clear_specific_day_window, set_chunk_hints, or propose_slot_overrides, your next response must be action="final" with needs_regeneration=true.
 - Use scheduling_hints values (priority, skip, must_schedule_before, preferred_date, preferred_time_of_day) when available.
--  For feedback like "30 minute sessions" or "only 30 minutes per day":
-  {{"action": "final", "updated_constraints": {{"max_slot_minutes": 30, "min_slot_minutes": 30}}, "needs_regeneration": true, "reason": "user_requested_30min_sessions"}}
+- For feedback restricting session lengths (e.g. "keep sessions short"):
+  Set updated_constraints for "max_slot_minutes" and "daily_max_minutes" accordingly and set needs_regeneration=true.
 - If shorter sessions may increase total days beyond end_date, that is acceptable — do not block the update.
 
 in the end for the final json result start with ```json and end with ```
@@ -1132,6 +1125,35 @@ def _extract_daily_max_minutes_from_text(text):
     )
 
     amount_pattern = r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|mins?|min|m)\b"
+
+    def _duration_minutes_from_window(window_text):
+        # Support compound durations like "1 hr 15 mins" in addition to single-unit values.
+        compound = re.search(
+            r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h)\s*(?:and\s*)?(\d+(?:\.\d+)?)?\s*(minutes?|mins?|min|m)?\b",
+            window_text,
+        )
+        if compound:
+            try:
+                hours = float(compound.group(1))
+                mins = float(compound.group(3)) if compound.group(3) and compound.group(4) else 0.0
+                total = int(round(hours * 60 + mins))
+                return _normalize_optional_int(total, minimum=0)
+            except Exception:
+                pass
+
+        single = re.search(amount_pattern, window_text)
+        if not single:
+            return None
+
+        try:
+            amount = float(single.group(1))
+        except Exception:
+            return None
+
+        unit = str(single.group(2) or "").strip().lower()
+        minutes = int(round(amount * 60)) if unit.startswith("h") else int(round(amount))
+        return _normalize_optional_int(minutes, minimum=0)
+
     for match in re.finditer(amount_pattern, normalized):
         window_start = max(0, int(match.start()) - 80)
         window_end = min(len(normalized), int(match.end()) + 80)
@@ -1146,18 +1168,11 @@ def _extract_daily_max_minutes_from_text(text):
         if not has_limit_context and not has_study_context:
             continue
 
-        try:
-            amount = float(match.group(1))
-        except Exception:
+        minutes = _duration_minutes_from_window(window)
+        if minutes is None:
             continue
 
-        unit = str(match.group(2) or "").strip().lower()
-        if unit.startswith("h"):
-            minutes = int(round(amount * 60))
-        else:
-            minutes = int(round(amount))
-
-        return _normalize_optional_int(minutes, minimum=0)
+        return minutes
 
     return None
 
@@ -1523,7 +1538,7 @@ Rules:
 - If user_feedback is present, verify whether the current plan already satisfies that request before suggesting schedule changes.
 - Never suggest a change that reverses explicit user timing feedback already reflected in the slots.
 - If user_feedback or feedback_history contains explicit constraints and slots violate them, include this as a risk, set approval_ready=false, and use severity >= 2.
-- - If user_feedback requests a specific session duration (e.g. "30 minute sessions") but slots in the plan exceed that duration, set approval_ready=false, severity=2, and include it as a risk.
+- If user_feedback requests a specific session duration limit but slots in the plan exceed that duration, set approval_ready=false, severity=2, and include it as a risk.
 """
 
     response = safe_ollama_call(prompt)
