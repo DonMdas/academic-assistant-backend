@@ -6,14 +6,12 @@ import time
 import os
 import re
 from collections.abc import Mapping
-from config import OLLAMA_BASE_URL, DISABLE_OLLAMA_THINKING, QWEN_MODEL
-
-try:
-    from google import genai
-    from google.genai import types as genai_types
-except Exception:
-    genai = None
-    genai_types = None
+from config import (
+    OLLAMA_BASE_URL,
+    OLLAMA_BACKUP_BASE_URL,
+    DISABLE_OLLAMA_THINKING,
+    QWEN_MODEL,
+)
 
 MODEL = QWEN_MODEL
 
@@ -86,14 +84,15 @@ Return JSON:
 """
 
 
-def _build_ollama_client():
+def _build_ollama_client(host):
     # Newer ollama versions expose Client(host=...), while some older builds may differ.
-    if hasattr(ollama, "Client"):
-        return ollama.Client(host=OLLAMA_BASE_URL)
+    if hasattr(ollama, "Client") and host:
+        return ollama.Client(host=host)
     return None
 
 
-OLLAMA_CLIENT = _build_ollama_client()
+OLLAMA_CLIENT_MAIN = _build_ollama_client(OLLAMA_BASE_URL)
+OLLAMA_CLIENT_BACKUP = _build_ollama_client(OLLAMA_BACKUP_BASE_URL)
 
 
 def _as_dict(value):
@@ -203,57 +202,25 @@ def _prepend_no_think_message(messages):
     return [{"role": "system", "content": "/no_think"}] + cleaned
 
 
-def _build_fallback_prompt(messages, enforce_json=False):
-    parts = []
-    if enforce_json:
-        parts.append(
-            "Return ONLY a valid JSON object. "
-            "No markdown, no explanations, no extra text."
-        )
-    for message in list(messages or []):
-        message_dict = _message_to_dict(message)
-        role = str(message_dict.get("role", "user") or "user").strip().lower()
-        content = str(message_dict.get("content", "") or "").strip()
-        if not content:
-            continue
-        if role:
-            parts.append(f"{role}: {content}")
-        else:
-            parts.append(content)
-    return "\n".join(parts).strip()
+def _chat_with_host(chat_kwargs, host=None, client=None):
+    if client is not None:
+        return client.chat(**chat_kwargs)
+
+    if host:
+        prior_host = os.environ.get("OLLAMA_HOST")
+        os.environ["OLLAMA_HOST"] = host
+        try:
+            return ollama.chat(**chat_kwargs)
+        finally:
+            if prior_host is None:
+                os.environ.pop("OLLAMA_HOST", None)
+            else:
+                os.environ["OLLAMA_HOST"] = prior_host
+
+    return ollama.chat(**chat_kwargs)
 
 
-def _chat_gemma_fallback(messages, output_format=None):
-    model_name = os.getenv("GEMMA_FALLBACK_MODEL", "gemma-4-26b-a4b-it")
-    api_key = os.getenv("GEMINI_API_KEY")
-    if genai is None or not api_key:
-        return {}
-
-    client = genai.Client(api_key=api_key)
-    prompt = _build_fallback_prompt(messages, enforce_json=(output_format == "json"))
-    if not prompt:
-        return {}
-
-    config_kwargs = {
-        "temperature": 0.1,
-        "max_output_tokens": 1024,
-    }
-    if output_format == "json":
-        config_kwargs["response_mime_type"] = "application/json"
-
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=genai_types.GenerateContentConfig(**config_kwargs),
-    )
-    raw_text = str(getattr(response, "text", "") or "").strip()
-    if not raw_text:
-        return {}
-
-    return _normalize_chat_response({"message": {"content": raw_text}})
-
-
-def _chat_once(messages, output_format=None):
+def _chat_once(messages, output_format=None, client=None, host=None):
     chat_kwargs = {
         "model": MODEL,
         "messages": list(messages or []),
@@ -269,10 +236,7 @@ def _chat_once(messages, output_format=None):
         chat_kwargs["think"] = False
 
     try:
-        if OLLAMA_CLIENT is not None:
-            response = OLLAMA_CLIENT.chat(**chat_kwargs)
-        else:
-            response = ollama.chat(**chat_kwargs)
+        response = _chat_with_host(chat_kwargs, host=host, client=client)
         return _normalize_chat_response(response)
     except TypeError:
         # Older client builds may not support think=False; fall back to prompt-level switch.
@@ -280,35 +244,31 @@ def _chat_once(messages, output_format=None):
         if should_disable_thinking:
             chat_kwargs["messages"] = _prepend_no_think_message(chat_kwargs.get("messages", []))
 
-        if OLLAMA_CLIENT is not None:
-            response = OLLAMA_CLIENT.chat(**chat_kwargs)
-        else:
-            response = ollama.chat(**chat_kwargs)
+        response = _chat_with_host(chat_kwargs, host=host, client=client)
         return _normalize_chat_response(response)
 
 
 def chat_ollama(messages, output_format=None, retries=3):
-    for attempt in range(retries):
-        try:
-            response = _chat_once(messages=messages, output_format=output_format)
-            if output_format == "json":
-                content = str(response.get("message", {}).get("content", "") or "").strip()
-                if not _parse_json_content(content):
-                    raise ValueError("Ollama returned non-JSON content")
-            return response
-        except Exception as e:
-            print(f"⚠️ Ollama attempt {attempt + 1} failed: {e}")
+    endpoints = [(OLLAMA_CLIENT_MAIN, OLLAMA_BASE_URL)]
+    if OLLAMA_BACKUP_BASE_URL:
+        endpoints.append((OLLAMA_CLIENT_BACKUP, OLLAMA_BACKUP_BASE_URL))
 
-        try:
-            fallback_response = _chat_gemma_fallback(messages, output_format=output_format)
-            if fallback_response:
+    for attempt in range(retries):
+        for client, host in endpoints:
+            try:
+                response = _chat_once(
+                    messages=messages,
+                    output_format=output_format,
+                    client=client,
+                    host=host,
+                )
                 if output_format == "json":
-                    content = str(fallback_response.get("message", {}).get("content", "") or "").strip()
+                    content = str(response.get("message", {}).get("content", "") or "").strip()
                     if not _parse_json_content(content):
-                        raise ValueError("Gemma returned non-JSON content")
-                return fallback_response
-        except Exception as e:
-            print(f"⚠️ Gemma fallback attempt {attempt + 1} failed: {e}")
+                        raise ValueError("Ollama returned non-JSON content")
+                return response
+            except Exception as e:
+                print(f"⚠️ Ollama attempt {attempt + 1} failed on {host}: {e}")
 
         if attempt < retries - 1:
             time.sleep(1)

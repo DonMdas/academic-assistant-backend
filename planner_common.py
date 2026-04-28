@@ -83,6 +83,8 @@ SCHEDULING_CONSTRAINT_KEYS = {
     "daily_max_minutes",
     "min_slot_minutes",
     "max_slot_minutes",
+    "start_date",
+    "end_date",
     "include_weekends",
     "blocked_weekdays",
     "blocked_dates",

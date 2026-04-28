@@ -688,7 +688,13 @@ def _run_planner_pipeline(
             locked_keys=locked_constraint_keys,
         )
 
-        changed = updated_constraints != current_constraints
+        next_start_date, next_end_date = _resolve_date_range(updated_constraints)
+        date_range_changed = (next_start_date != start_date) or (next_end_date != end_date)
+        if date_range_changed:
+            start_date = next_start_date
+            end_date = next_end_date
+
+        changed = updated_constraints != current_constraints or date_range_changed
         needs_regeneration = bool(dict(gemma_feedback or {}).get("needs_regeneration", False))
         current_constraints = updated_constraints
 
@@ -739,6 +745,11 @@ def _run_planner_pipeline(
             "phase": "api_plan_generate" if run_main_passes else "api_plan_revise",
             "session_id": schedule_id,
             "plan": _plan_snapshot(slots=slots, coverage=coverage, constraints=current_constraints),
+            "date_range": {
+                "start": start_date.isoformat(),
+                "end": end_date.isoformat(),
+                "schedule_end": schedule_end.isoformat(),
+            },
         }
 
         _op_log(operation_id, "Running Qwen review", metadata={"phase": review_payload.get("phase")})
@@ -837,10 +848,16 @@ def _run_planner_pipeline(
             locked_keys=locked_constraint_keys,
         )
 
+        next_start_date, next_end_date = _resolve_date_range(refined_constraints)
+        date_range_changed = (next_start_date != start_date) or (next_end_date != end_date)
+        if date_range_changed:
+            start_date = next_start_date
+            end_date = next_end_date
+
         before_constraints = dict(current_constraints)
         before_coverage = dict(coverage)
         should_regenerate = bool(dict(post_review_gemma_feedback or {}).get("needs_regeneration", False))
-        constraints_changed = refined_constraints != current_constraints
+        constraints_changed = refined_constraints != current_constraints or date_range_changed
 
         if should_regenerate or constraints_changed:
             current_constraints = refined_constraints
@@ -863,6 +880,11 @@ def _run_planner_pipeline(
                     "needs_regeneration": dict(post_review_gemma_feedback or {}).get("needs_regeneration", False),
                 },
                 "plan": _plan_snapshot(slots=slots, coverage=coverage, constraints=current_constraints),
+                "date_range": {
+                    "start": start_date.isoformat(),
+                    "end": end_date.isoformat(),
+                    "schedule_end": schedule_end.isoformat(),
+                },
             }
             qwen_feedback = qwen_review_plan(review_payload)
             qwen_feedback_history.append(dict(qwen_feedback or {}))
@@ -944,11 +966,17 @@ def _run_planner_pipeline(
             locked_keys=locked_constraint_keys,
         )
 
+        next_start_date, next_end_date = _resolve_date_range(revised_constraints)
+        date_range_changed = (next_start_date != start_date) or (next_end_date != end_date)
+        if date_range_changed:
+            start_date = next_start_date
+            end_date = next_end_date
+
         before_constraints = dict(current_constraints)
         before_coverage = dict(coverage)
         chunk_updates = user_revision_feedback.get("updated_chunk_prerequisites", [])
         chunks_changed = apply_chunk_prerequisite_updates(chunks, chunk_updates)
-        constraints_changed = revised_constraints != current_constraints
+        constraints_changed = revised_constraints != current_constraints or date_range_changed
 
         if constraints_changed:
             current_constraints = revised_constraints
@@ -975,6 +1003,11 @@ def _run_planner_pipeline(
                 "plan": _plan_snapshot(slots=slots, coverage=coverage, constraints=current_constraints),
                 "user_feedback": feedback_text,
                 "feedback_history": list(feedback_history_rows),
+                "date_range": {
+                    "start": start_date.isoformat(),
+                    "end": end_date.isoformat(),
+                    "schedule_end": schedule_end.isoformat(),
+                },
             }
             qwen_feedback = qwen_review_plan(review_payload)
             qwen_feedback_history.append(dict(qwen_feedback or {}))
@@ -1015,6 +1048,11 @@ def _run_planner_pipeline(
                 "plan": _plan_snapshot(slots=slots, coverage=coverage, constraints=current_constraints),
                 "user_feedback": feedback_text,
                 "feedback_history": list(feedback_history_rows),
+                "date_range": {
+                    "start": start_date.isoformat(),
+                    "end": end_date.isoformat(),
+                    "schedule_end": schedule_end.isoformat(),
+                },
             }
             _op_log(operation_id, "Running Qwen review", metadata={"phase": review_payload.get("phase")})
             qwen_feedback = qwen_review_plan(review_payload)

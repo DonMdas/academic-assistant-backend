@@ -46,6 +46,12 @@ def _normalize_ollama_base_url(value: str | None) -> str:
 
 # Default Ollama host is local; override with OLLAMA_BASE_URL for remote devices.
 OLLAMA_BASE_URL = _normalize_ollama_base_url(os.getenv("OLLAMA_BASE_URL"))
+_raw_backup_ollama_url = os.getenv("OLLAMA_BACKUP_BASE_URL")
+OLLAMA_BACKUP_BASE_URL = (
+    _normalize_ollama_base_url(_raw_backup_ollama_url)
+    if _raw_backup_ollama_url
+    else ""
+)
 
 # Planner backend for Gemma orchestration: "gemini" or "ollama".
 GEMMA_BACKEND = _env_text("GEMMA_BACKEND", "gemini").lower() or "gemini"

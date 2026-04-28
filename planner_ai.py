@@ -852,6 +852,12 @@ def apply_constraint_updates(current, updates, locked_keys=None):
         if key in locked:
             continue
 
+        if key in {"start_date", "end_date"}:
+            parsed = _parse_date_str(value)
+            if parsed is not None:
+                merged[key] = parsed.isoformat()
+            continue
+
         if key in {"daily_max_minutes", "min_slot_minutes", "max_slot_minutes", "buffer_days"}:
             if key == "buffer_days":
                 merged[key] = _normalize_int(value, merged.get(key, DEFAULT_CONSTRAINTS[key]), minimum=0)
@@ -892,6 +898,35 @@ def apply_constraint_updates(current, updates, locked_keys=None):
         merged[key] = str(value or "").strip()
 
     return _normalize_constraints(merged)
+
+
+def _date_range_violations(payload):
+    context = dict(payload or {})
+    date_range = dict(context.get("date_range") or {})
+    start = _parse_date_str(date_range.get("start"))
+    end = _parse_date_str(date_range.get("end"))
+    if start is None or end is None:
+        return []
+
+    plan = dict(context.get("plan") or {})
+    slots = plan.get("slots")
+    if not isinstance(slots, list):
+        return []
+
+    violating = set()
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        start_time = str(slot.get("start_time") or "").strip()
+        if not start_time:
+            continue
+        parsed = _parse_date_str(start_time[:10])
+        if parsed is None:
+            continue
+        if parsed < start or parsed > end:
+            violating.add(parsed.isoformat())
+
+    return sorted(list(violating))
 
 
 def apply_chunk_prerequisite_updates(chunks, updates):
@@ -1451,6 +1486,13 @@ def _align_qwen_feedback_with_user_constraints(payload, normalized):
         return normalized
 
     issues = _feedback_compliance_issues(payload)
+    range_violations = _date_range_violations(payload)
+    if range_violations:
+        issues.append(
+            "Slots fall outside the requested date range: "
+            + ", ".join(range_violations)
+            + "."
+        )
     if not issues:
         return normalized
 
